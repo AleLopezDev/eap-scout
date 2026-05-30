@@ -1,0 +1,40 @@
+[*] Reading capture: /tmp/wifi-global-01.cap
+
+------------------------------------------------------------
+Clients
+------------------------------------------------------------
+
+Client: 64:32:a8:ba:18:42
+  Identities:
+    - GLOBAL\GlobalAdmin (real/possibly real)
+  EAP methods:
+    - EAP-TLS
+      Client certificate required. No MSCHAPv2 password hash is exposed.
+  Verdict: EAP-TLS observed. Valid client certificate and private key are required for authentication.
+
+Client: 64:32:a8:bc:53:51
+  Identities:
+    - GLOBAL\anonymous (anonymous)
+  EAP methods:
+    - EAP-TLS
+      Client certificate required. No MSCHAPv2 password hash is exposed.
+  Verdict: EAP-TLS observed. Valid client certificate and private key are required for authentication.
+
+------------------------------------------------------------
+AP/RADIUS proposals
+------------------------------------------------------------
+f0:9f:c2:71:22:17 -> 64:32:a8:ba:18:42: EAP-TLS
+f0:9f:c2:71:22:17 -> 64:32:a8:bc:53:51: EAP-TLS
+
+------------------------------------------------------------
+Summary
+------------------------------------------------------------
+Methods observed:    EAP-TLS
+Identities observed: GLOBAL\GlobalAdmin,GLOBAL\anonymous
+
+Interpretation notes:
+  EAP-TLS    Requires a valid client certificate and private key. No MSCHAPv2 hash is exposed.
+  PEAP       Outer method only; confirm PEAP-MSCHAPv2 with supplicant logs, Eaphammer/MANA, or EAP_buster.
+  EAP-TTLS   Outer method only; PAP/CHAP/MSCHAPv2/GTC usually lives inside the TLS tunnel.
+  EAP-MD5    Legacy/weak.
+  LEAP       Legacy/weak.
