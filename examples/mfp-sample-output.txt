@@ -1,0 +1,41 @@
+[*] Reading capture: /tmp/wifi-corp-01.cap
+
+------------------------------------------------------------
+Access points
+------------------------------------------------------------
+
+AP: f0:9f:c2:71:22:15
+  SSID: wifi-corp
+  PMF:  PMF capable / optional
+  Note: AP supports PMF, but it is not advertised as mandatory.
+
+------------------------------------------------------------
+Clients
+------------------------------------------------------------
+
+Client: 64:32:a8:ba:6c:41
+  Frame: 1288
+  SSID:  wifi-corp
+  AP:    f0:9f:c2:71:22:15
+  PMF:   PMF not advertised
+  Deauth verdict: Classic aireplay-ng deauth is likely to work if the client is in range and the AP accepts unprotected management frames.
+
+Client: 64:32:a8:a9:de:55
+  Frame: 1942
+  SSID:  wifi-regional-tablets
+  AP:    f0:9f:c2:7a:33:28
+  PMF:   PMF required
+  Deauth verdict: Classic aireplay-ng deauth is unlikely to work; protected management frames are required.
+
+------------------------------------------------------------
+Summary
+------------------------------------------------------------
+Clients observed:       2
+PMF capable entries:    1
+PMF required entries:   1
+
+Interpretation notes:
+  PMF required              -> classic forged deauth is unlikely to work.
+  PMF capable / optional    -> deauth may work depending on negotiation and AP/client policy.
+  PMF not advertised        -> classic deauth is more likely to work.
+  unknown                   -> capture is incomplete; collect association/reassociation frames.
