@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+
+# eap-scout
+# Lightweight EAP method and identity inspector for 802.1X/WPA-Enterprise captures.
+#
+# Usage:
+#   ./eap-scout capture.cap
+#
+# Notes:
+#   - Passive captures usually reveal the outer EAP method only.
+#   - PEAP/TTLS inner methods are commonly protected inside the TLS tunnel.
+#   - Use this tool only on networks and captures you are authorized to assess.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+CAP="${1:-}"
+
+usage() {
+  cat << EOF
+Usage:
+  eap-scout <capture.cap|capture.pcap|capture.pcapng>
+
+Examples:
+  eap-scout wifi-global-01.cap
+  eap-scout ./captures/corp-auth.pcapng
+
+Options:
+  -h, --help      Show this help message
+  -v, --version   Show version
+EOF
+}
+
+if [[ "${CAP}" == "-h" || "${CAP}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${CAP}" == "-v" || "${CAP}" == "--version" ]]; then
+  echo "eap-scout ${VERSION}"
+  exit 0
+fi
+
+if [[ -z "${CAP}" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ ! -f "${CAP}" ]]; then
+  echo "[!] Capture not found: ${CAP}" >&2
+  exit 1
+fi
+
+if ! command -v tshark >/dev/null 2>&1; then
+  echo "[!] Missing dependency: tshark" >&2
+  echo "    Debian/Ubuntu/Kali: sudo apt install tshark" >&2
+  echo "    Arch Linux:        sudo pacman -S wireshark-cli" >&2
+  exit 1
+fi
+
+map_eap_type() {
+  local type_id="${1:-}"
+
+  case "${type_id}" in
+    1)  echo "Identity" ;;
+    4)  echo "EAP-MD5" ;;
+    13) echo "EAP-TLS" ;;
+    17) echo "LEAP" ;;
+    21) echo "EAP-TTLS" ;;
+    25) echo "PEAP" ;;
+    26) echo "EAP-MSCHAPV2" ;;
+    43) echo "EAP-FAST" ;;
+    "") echo "Unknown" ;;
+    *)  echo "EAP-Type-${type_id}" ;;
+  esac
+}
+
+method_note() {
+  local method="${1:-}"
+
+  case "${method}" in
+    "EAP-TLS")
+      echo "Client certificate required. No MSCHAPv2 password hash is exposed."
+      ;;
+    "PEAP")
+      echo "Outer TLS tunnel. Inner method may be MSCHAPv2/GTC/etc. and is often not visible passively."
+      ;;
+    "EAP-TTLS")
+      echo "Outer TLS tunnel. Inner PAP/CHAP/MSCHAPv2/GTC is usually encrypted."
+      ;;
+    "EAP-MD5")
+      echo "Legacy/weak challenge-response method. Review immediately."
+      ;;
+    "LEAP")
+      echo "Legacy Cisco method. Dictionary attacks may be viable."
+      ;;
+    "EAP-MSCHAPV2")
+      echo "MSCHAPv2 visible. Captured challenge/response may be crackable if complete."
+      ;;
+    "EAP-FAST")
+      echo "Uses PAC provisioning. Review deployment and provisioning mode."
+      ;;
+    *)
+      echo "Visible EAP method found in the capture."
+      ;;
+  esac
+}
+
+identity_type() {
+  local identity="${1:-}"
+
+  if [[ -z "${identity}" ]]; then
+    echo "not captured"
+  elif echo "${identity}" | grep -Eiq 'anon|anonymous|anonimo|an[oó]nimo'; then
+    echo "anonymous"
+  else
+    echo "real/possibly real"
+  fi
+}
+
+client_conclusion() {
+  local methods="${1:-}"
+
+  if echo "${methods}" | grep -q "EAP-TLS"; then
+    echo "EAP-TLS observed. Valid client certificate and private key are required for authentication."
+  elif echo "${methods}" | grep -q "PEAP"; then
+    echo "PEAP observed. Confirm the inner method with active tooling or supplicant logs."
+  elif echo "${methods}" | grep -q "EAP-TTLS"; then
+    echo "EAP-TTLS observed. Inner authentication is normally hidden inside the TLS tunnel."
+  elif echo "${methods}" | grep -q "EAP-MD5"; then
+    echo "EAP-MD5 observed. This is a weak/obsolete configuration."
+  elif echo "${methods}" | grep -q "LEAP"; then
+    echo "LEAP observed. This is a legacy/weak configuration."
+  else
+    echo "No strong conclusion. Capture may be incomplete."
+  fi
+}
+
+print_rule() {
+  printf '%s\n' "------------------------------------------------------------"
+}
+
+TMP_ID="$(mktemp)"
+TMP_METHODS="$(mktemp)"
+TMP_REQS="$(mktemp)"
+trap 'rm -f "$TMP_ID" "$TMP_METHODS" "$TMP_REQS"' EXIT
+
+echo "[*] Reading capture: ${CAP}"
+
+DATA="$ (
+  true
+)"
+
+DATA="$(
+  tshark -r "${CAP}" \
+    -Y "eap" \
+    -T fields \
+    -e frame.number \
+    -e wlan.sa \
+    -e wlan.da \
+    -e wlan.bssid \
+    -e eap.code \
+    -e eap.type \
+    -e eap.identity 2>/dev/null \
+  | sort -u
+)"
+
+if [[ -z "${DATA}" ]]; then
+  echo "[!] No EAP packets found. Capture an 802.1X authentication exchange and try again."
+  exit 0
+fi
+
+while IFS=$'\t' read -r frame src dst bssid code type identity; do
+  [[ -z "${src:-}" ]] && continue
+
+  method="$(map_eap_type "${type:-}")"
+
+  # EAP Response from client: code 2.
+  if [[ "${code:-}" == "2" ]]; then
+    if [[ "${type:-}" == "1" && -n "${identity:-}" ]]; then
+      printf '%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "${identity}" >> "${TMP_ID}"
+    fi
+
+    # Do not report Identity as an authentication method.
+    if [[ -n "${type:-}" && "${type}" != "1" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "${method}" "${type}" >> "${TMP_METHODS}"
+    fi
+  fi
+
+  # EAP Request from AP/RADIUS: code 1.
+  if [[ "${code:-}" == "1" && -n "${type:-}" ]]; then
+    printf '%s\t%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "${method}" "${type}" >> "${TMP_REQS}"
+  fi
+done <<< "${DATA}"
+
+echo
+print_rule
+echo "Clients"
+print_rule
+
+if [[ ! -s "${TMP_METHODS}" && ! -s "${TMP_ID}" ]]; then
+  echo "[!] EAP packets were found, but no useful client responses were detected."
+  echo "    Capture a full association/authentication exchange and try again."
+  exit 0
+fi
+
+CLIENTS="$(
+  {
+    [[ -s "${TMP_METHODS}" ]] && cut -f1 "${TMP_METHODS}"
+    [[ -s "${TMP_ID}" ]] && cut -f1 "${TMP_ID}"
+  } | sort -u
+)"
+
+while read -r client; do
+  [[ -z "${client}" ]] && continue
+
+  methods="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_METHODS}" 2>/dev/null | sort -u | paste -sd ',' -)"
+  identities="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd ',' -)"
+
+  [[ -z "${methods}" ]] && methods="not detected"
+  [[ -z "${identities}" ]] && identities="not captured"
+
+  echo
+  echo "Client: ${client}"
+
+  echo "  Identities:"
+  IFS=',' read -ra identity_list <<< "${identities}"
+  for identity in "${identity_list[@]}"; do
+    [[ -z "${identity}" ]] && continue
+    echo "    - ${identity} ($(identity_type "${identity}"))"
+  done
+
+  echo "  EAP methods:"
+  IFS=',' read -ra method_list <<< "${methods}"
+  for method in "${method_list[@]}"; do
+    [[ -z "${method}" ]] && continue
+    if [[ "${method}" == "not detected" ]]; then
+      echo "    - not detected"
+    else
+      echo "    - ${method}"
+      echo "      ${method_note "${method}"}"
+    fi
+  done
+
+  echo "  Verdict: $(client_conclusion "${methods}")"
+done <<< "${CLIENTS}"
+
+echo
+print_rule
+echo "AP/RADIUS proposals"
+print_rule
+
+if [[ ! -s "${TMP_REQS}" ]]; then
+  echo "No EAP method proposals were found."
+else
+  sort -u "${TMP_REQS}" | while IFS=$'\t' read -r ap client method type; do
+    [[ "${method}" == "Identity" ]] && continue
+    echo "${ap} -> ${client}: ${method}"
+  done
+fi
+
+echo
+print_rule
+echo "Summary"
+print_rule
+
+all_methods="$(awk -F'\t' '{print $3}' "${TMP_METHODS}" 2>/dev/null | sort -u | paste -sd ',' -)"
+all_ids="$(awk -F'\t' '{print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd ',' -)"
+
+[[ -z "${all_methods}" ]] && all_methods="not detected"
+[[ -z "${all_ids}" ]] && all_ids="not captured"
+
+echo "Methods observed:    ${all_methods}"
+echo "Identities observed: ${all_ids}"
+echo
+cat << EOF
+Interpretation notes:
+  EAP-TLS    Requires a valid client certificate and private key. No MSCHAPv2 hash is exposed.
+  PEAP       Outer method only; confirm PEAP-MSCHAPv2 with supplicant logs, Eaphammer/MANA, or EAP_buster.
+  EAP-TTLS   Outer method only; PAP/CHAP/MSCHAPv2/GTC usually lives inside the TLS tunnel.
+  EAP-MD5    Legacy/weak.
+  LEAP       Legacy/weak.
+EOF
