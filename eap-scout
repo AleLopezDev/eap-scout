@@ -9,11 +9,12 @@
 # Notes:
 #   - Passive captures usually reveal the outer EAP method only.
 #   - PEAP/TTLS inner methods are commonly protected inside the TLS tunnel.
+#   - EAP Type 3 is a Nak, not an authentication method.
 #   - Use this tool only on networks and captures you are authorized to assess.
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 CAP="${1:-}"
 
 usage() {
@@ -63,6 +64,7 @@ map_eap_type() {
 
   case "${type_id}" in
     1)  echo "Identity" ;;
+    3)  echo "Legacy Nak" ;;
     4)  echo "EAP-MD5" ;;
     13) echo "EAP-TLS" ;;
     17) echo "LEAP" ;;
@@ -120,8 +122,11 @@ identity_type() {
 
 client_conclusion() {
   local methods="${1:-}"
+  local naks="${2:-}"
 
-  if echo "${methods}" | grep -q "EAP-TLS"; then
+  if [[ "${methods}" == "not detected" && "${naks}" != "not observed" ]]; then
+    echo "EAP Nak observed. The client rejected the proposed method; inspect AP/RADIUS proposals and Nak details."
+  elif echo "${methods}" | grep -q "EAP-TLS"; then
     echo "EAP-TLS observed. Valid client certificate and private key are required for authentication."
   elif echo "${methods}" | grep -q "PEAP"; then
     echo "PEAP observed. Confirm the inner method with active tooling or supplicant logs."
@@ -142,14 +147,11 @@ print_rule() {
 
 TMP_ID="$(mktemp)"
 TMP_METHODS="$(mktemp)"
+TMP_NAKS="$(mktemp)"
 TMP_REQS="$(mktemp)"
-trap 'rm -f "$TMP_ID" "$TMP_METHODS" "$TMP_REQS"' EXIT
+trap 'rm -f "$TMP_ID" "$TMP_METHODS" "$TMP_NAKS" "$TMP_REQS"' EXIT
 
 echo "[*] Reading capture: ${CAP}"
-
-DATA="$ (
-  true
-)"
 
 DATA="$(
   tshark -r "${CAP}" \
@@ -181,6 +183,12 @@ while IFS=$'\t' read -r frame src dst bssid code type identity; do
       printf '%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "${identity}" >> "${TMP_ID}"
     fi
 
+    # EAP Type 3 is Legacy Nak. It means the peer rejected the proposed method.
+    if [[ "${type:-}" == "3" ]]; then
+      printf '%s\t%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "Legacy Nak" "${type}" >> "${TMP_NAKS}"
+      continue
+    fi
+
     # Do not report Identity as an authentication method.
     if [[ -n "${type:-}" && "${type}" != "1" ]]; then
       printf '%s\t%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "${method}" "${type}" >> "${TMP_METHODS}"
@@ -198,7 +206,7 @@ print_rule
 echo "Clients"
 print_rule
 
-if [[ ! -s "${TMP_METHODS}" && ! -s "${TMP_ID}" ]]; then
+if [[ ! -s "${TMP_METHODS}" && ! -s "${TMP_ID}" && ! -s "${TMP_NAKS}" ]]; then
   echo "[!] EAP packets were found, but no useful client responses were detected."
   echo "    Capture a full association/authentication exchange and try again."
   exit 0
@@ -208,6 +216,7 @@ CLIENTS="$(
   {
     [[ -s "${TMP_METHODS}" ]] && cut -f1 "${TMP_METHODS}"
     [[ -s "${TMP_ID}" ]] && cut -f1 "${TMP_ID}"
+    [[ -s "${TMP_NAKS}" ]] && cut -f1 "${TMP_NAKS}"
   } | sort -u
 )"
 
@@ -216,9 +225,11 @@ while read -r client; do
 
   methods="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_METHODS}" 2>/dev/null | sort -u | paste -sd ',' -)"
   identities="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd ',' -)"
+  naks="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_NAKS}" 2>/dev/null | sort -u | paste -sd ',' -)"
 
   [[ -z "${methods}" ]] && methods="not detected"
   [[ -z "${identities}" ]] && identities="not captured"
+  [[ -z "${naks}" ]] && naks="not observed"
 
   echo
   echo "Client: ${client}"
@@ -238,11 +249,17 @@ while read -r client; do
       echo "    - not detected"
     else
       echo "    - ${method}"
-      echo "      ${method_note "${method}"}"
+      echo "      $(method_note "${method}")"
     fi
   done
 
-  echo "  Verdict: $(client_conclusion "${methods}")"
+  if [[ "${naks}" != "not observed" ]]; then
+    echo "  Negotiation:"
+    echo "    - Legacy Nak observed"
+    echo "      The client rejected the proposed EAP method. This is not an authentication method and will not produce a hash by itself."
+  fi
+
+  echo "  Verdict: $(client_conclusion "${methods}" "${naks}")"
 done <<< "${CLIENTS}"
 
 echo
@@ -266,12 +283,14 @@ print_rule
 
 all_methods="$(awk -F'\t' '{print $3}' "${TMP_METHODS}" 2>/dev/null | sort -u | paste -sd ',' -)"
 all_ids="$(awk -F'\t' '{print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd ',' -)"
+nak_count="$(wc -l < "${TMP_NAKS}" | tr -d ' ')"
 
 [[ -z "${all_methods}" ]] && all_methods="not detected"
 [[ -z "${all_ids}" ]] && all_ids="not captured"
 
 echo "Methods observed:    ${all_methods}"
 echo "Identities observed: ${all_ids}"
+echo "Legacy Nak observed: ${nak_count}"
 echo
 cat << EOF
 Interpretation notes:
@@ -280,4 +299,5 @@ Interpretation notes:
   EAP-TTLS   Outer method only; PAP/CHAP/MSCHAPv2/GTC usually lives inside the TLS tunnel.
   EAP-MD5    Legacy/weak.
   LEAP       Legacy/weak.
+  Legacy Nak The client rejected the proposed EAP method. Inspect proposals and try compatible methods.
 EOF
