@@ -62,7 +62,7 @@ def main() -> int:
 
     try:
         challenge = bytes.fromhex(clean_hex(args.challenge))
-        target = clean_hex(args.response)
+        target = bytes.fromhex(clean_hex(args.response))
     except ValueError as exc:
         print(f"[!] Invalid hex input: {exc}", file=sys.stderr)
         return 1
@@ -71,7 +71,7 @@ def main() -> int:
         print("[!] Empty challenge", file=sys.stderr)
         return 1
 
-    if len(target) != 32:
+    if len(target) != 16:
         print("[!] EAP-MD5 response should be a 16-byte MD5 digest represented as 32 hex characters", file=sys.stderr)
         return 1
 
@@ -81,7 +81,7 @@ def main() -> int:
         for line in handle:
             attempts += 1
             password = line.rstrip(b"\r\n")
-            digest = hashlib.md5(bytes([args.eap_id]) + password + challenge).hexdigest()
+            digest = hashlib.md5(bytes([args.eap_id]) + password + challenge).digest()
 
             if digest == target:
                 printable = password.decode(errors="ignore")

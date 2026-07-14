@@ -59,6 +59,11 @@ if ! command -v tshark >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! tshark -r "${CAP}" -c 1 >/dev/null 2>&1; then
+  echo "[!] Invalid or unreadable capture: ${CAP}" >&2
+  exit 1
+fi
+
 map_eap_type() {
   local type_id="${1:-}"
 
@@ -120,18 +125,20 @@ identity_type() {
   fi
 }
 
-extract_nak_desired_type() {
-  local frame="${1:-}"
-  [[ -z "${frame}" ]] && { echo "unknown"; return; }
+map_desired() {
+  local raw="${1:-}"
+  [[ -z "${raw}" ]] && { echo "unknown"; return; }
 
-  local desired
-  desired="$(
-    tshark -r "${CAP}" -Y "frame.number == ${frame}" -V 2>/dev/null \
-      | awk -F': ' '/Desired Auth Type:/ {print $2; exit}'
-  )"
+  local out="" t
+  IFS=',' read -ra parts <<< "${raw}"
+  for t in "${parts[@]}"; do
+    t="${t//[[:space:]]/}"
+    [[ -z "${t}" ]] && continue
+    out+="${out:+, }$(map_eap_type "${t}") (${t})"
+  done
 
-  [[ -z "${desired}" ]] && desired="unknown"
-  echo "${desired}"
+  [[ -z "${out}" ]] && out="unknown"
+  echo "${out}"
 }
 
 client_conclusion() {
@@ -150,6 +157,10 @@ client_conclusion() {
     echo "EAP-MD5 observed. This is a weak/obsolete configuration."
   elif echo "${methods}" | grep -q "LEAP"; then
     echo "LEAP observed. This is a legacy/weak configuration."
+  elif echo "${methods}" | grep -q "EAP-MSCHAPV2"; then
+    echo "EAP-MSCHAPV2 observed. A complete challenge/response may be crackable."
+  elif echo "${methods}" | grep -q "EAP-FAST"; then
+    echo "EAP-FAST observed. Review PAC provisioning mode."
   else
     echo "No strong conclusion. Capture may be incomplete."
   fi
@@ -171,13 +182,17 @@ DATA="$(
   tshark -r "${CAP}" \
     -Y "eap" \
     -T fields \
+    -E separator=$'\x1f' \
     -e frame.number \
     -e wlan.sa \
     -e wlan.da \
     -e wlan.bssid \
+    -e eth.src \
+    -e eth.dst \
     -e eap.code \
     -e eap.type \
-    -e eap.identity 2>/dev/null \
+    -e eap.identity \
+    -e eap.desired_type 2>/dev/null \
   | sort -u
 )"
 
@@ -186,7 +201,9 @@ if [[ -z "${DATA}" ]]; then
   exit 0
 fi
 
-while IFS=$'\t' read -r frame src dst bssid code type identity; do
+while IFS=$'\x1f' read -r frame wlan_src wlan_dst bssid eth_src eth_dst code type identity desired_type; do
+  src="${wlan_src:-${eth_src:-}}"
+  dst="${wlan_dst:-${eth_dst:-}}"
   [[ -z "${src:-}" ]] && continue
 
   method="$(map_eap_type "${type:-}")"
@@ -199,7 +216,7 @@ while IFS=$'\t' read -r frame src dst bssid code type identity; do
 
     # EAP Type 3 is Legacy Nak. It means the peer rejected the proposed method.
     if [[ "${type:-}" == "3" ]]; then
-      desired="$(extract_nak_desired_type "${frame}")"
+      desired="$(map_desired "${desired_type:-}")"
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${src}" "${dst:-unknown}" "Legacy Nak" "${type}" "${frame}" "${desired}" >> "${TMP_NAKS}"
       continue
     fi
@@ -228,18 +245,14 @@ if [[ ! -s "${TMP_METHODS}" && ! -s "${TMP_ID}" && ! -s "${TMP_NAKS}" ]]; then
 fi
 
 CLIENTS="$(
-  {
-    [[ -s "${TMP_METHODS}" ]] && cut -f1 "${TMP_METHODS}"
-    [[ -s "${TMP_ID}" ]] && cut -f1 "${TMP_ID}"
-    [[ -s "${TMP_NAKS}" ]] && cut -f1 "${TMP_NAKS}"
-  } | sort -u
+  cut -f1 "${TMP_METHODS}" "${TMP_ID}" "${TMP_NAKS}" | sort -u
 )"
 
 while read -r client; do
   [[ -z "${client}" ]] && continue
 
   methods="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_METHODS}" 2>/dev/null | sort -u | paste -sd ',' -)"
-  identities="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd ',' -)"
+  identities="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_ID}" 2>/dev/null | sort -u | paste -sd $'\x1f' -)"
   naks="$(awk -F'\t' -v c="${client}" '$1 == c {print $3}' "${TMP_NAKS}" 2>/dev/null | sort -u | paste -sd ',' -)"
 
   [[ -z "${methods}" ]] && methods="not detected"
@@ -250,7 +263,7 @@ while read -r client; do
   echo "Client: ${client}"
 
   echo "  Identities:"
-  IFS=',' read -ra identity_list <<< "${identities}"
+  IFS=$'\x1f' read -ra identity_list <<< "${identities}"
   for identity in "${identity_list[@]}"; do
     [[ -z "${identity}" ]] && continue
     echo "    - ${identity} ($(identity_type "${identity}"))"
